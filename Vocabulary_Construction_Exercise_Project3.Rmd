@@ -1,0 +1,205 @@
+---
+title: "Overview of Customized Vocabulary Construction Exercise"
+author: "Suraj Nayak[surajn3], Sean Hawkins[seanch3], Soumava Dey[soumava2]"
+date: "11/25/2020"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Overview
+
+The purpose of this project is to build a binary classification model to predict the sentiment of IMDB movie review.
+
+The required performance goal is to achieve minimal value of AUC 0.96 over the five test datasets. For improvement of model interpretability and better comprehension of predictive results, the vocabulary size should be divided in three smaller ranges: (2000, 3000), (1000,2000) and <= 1000.
+
+```{r library, echo=TRUE, message=FALSE, warning=FALSE, include=TRUE}
+library(pROC)
+library(glmnet)
+library(text2vec)
+library(slam)
+```
+
+## Construction of DocumentMatrix:
+
+The process of building the vocabulary is similar to a feature selection process from the original dataset. We first built the vocabulary using a 76% sample of all 50,000 reviews with a tokenization process as described below: 
+
+1) Filtered out HTML tags. 
+
+2) Removed the following stop words: 
+
+i, me, my, myself, we, our, ours, ourselves, you, your, yours, their, they, his, her, she, he, a, an, and, is, was, are, were, him, himself, has, have, it, its, of, one, for, the, us, this
+
+3) Extracted 1 to 4 ngram terms 
+
+We pruned this vocabulary with conditions: 
+minimum 10 occurrences of a ngram over all documents.
+minimum 0.01% of documents which should contain the ngram. 
+maximum 50% of documents which should contain the ngram.
+
+4) Use function create_dtm() from R package `text2vec` to construct DT(DocumentTerm) matrix(maximum of 4 grams) containing a vocabulary of 31,764 ngrams.
+
+```{r preprocessing, echo=TRUE,include=TRUE}
+set.seed(2042)
+
+# Load all the data
+train = read.table("alldata.tsv",
+                   stringsAsFactors = FALSE,
+                   header = TRUE)
+
+# Randomly pick 76% of data
+sample_25k = sample.int(nrow(train) * 0.76)
+train = train[sample_25k,]
+
+# Replace the html tags
+train$review = gsub('<.*?>', ' ', train$review)
+
+# Create stopword list
+stop_words = c("i", "me", "my", "myself", 
+               "we", "our", "ours", "ourselves", 
+               "you", "your", "yours", 
+               "their", "they", "his", "her", 
+               "she", "he", "a", "an", "and",
+               "is", "was", "are", "were", 
+               "him", "himself", "has", "have", 
+               "it", "its", "the", "us")
+
+# Iterate over the training observation to lower case and tokenize words
+it_train = itoken(train$review,
+                  preprocessor = tolower, 
+                  tokenizer = word_tokenizer)
+
+# Create a vocabulary of unique terms with stop words and ngrams between 1 and 4 
+tmp.vocab = create_vocabulary(it_train, 
+                              stopwords = stop_words, 
+                              ngram = c(1L,4L))
+
+# Filter the input vocabulary to filter of very frequent and very infrequent terms
+tmp.vocab = prune_vocabulary(tmp.vocab, term_count_min = 10,
+                             doc_proportion_max = 0.5,
+                             doc_proportion_min = 0.001)
+
+# Create document-term matrix
+dtm_train  = create_dtm(it_train, vocab_vectorizer(tmp.vocab))
+dim(dtm_train)
+```
+
+## Construct custimized vocabulary using model:
+
+There are couple of modeling approaches have been tried to trim the size of vocabulary:
+
+1) (XG)Boosting to build a model on all review data and select features/terms using xgb.importance() ordered by Gain.  
+
+2) A logistic linear regression model with elasticnet regularization (alpha = 0.7) to fit the review data where the vocabulary is selected using positive and negative list of obtained via two sample t-test, then select the none-zero coefficient term. For these terms, we sorted by the absolute value of the coefficient, then picked the df comprised of desired vocabulary sizes of (2000,3000), (1000,2000) and less than 1000 ngrams.
+
+Our initial testing indicated the second approach performed better than the first one. Therefore, we decided to proceed with glmnet()
+
+Using the two sample t-test, we will be able to obtain top positive and negative words
+
+$$\frac{\bar{X} - \bar{Y}}{\sqrt{\frac{s^2_X}{m} + \frac{s^2_Y}{n}}}$$
+
+where 
+- $\bar{X}$ is the mean for positive sentiment
+- $\bar{Y}$ is the mean for negative sentiment
+- $s^2_X$ is the variance for positive sentiment
+- $s^2_Y$ is the variance for negative sentiment
+- $m$ is the number of observations for positive sentiment
+- $n$ is the number of observations for negative sentiment
+
+```{r t_test, echo=TRUE,include=TRUE}
+v.size = dim(dtm_train)[2]
+ytrain = train$sentiment
+
+summ = matrix(0, nrow=v.size, ncol=4)
+summ[,1] = colapply_simple_triplet_matrix(
+  as.simple_triplet_matrix(dtm_train[ytrain==1, ]), mean)
+summ[,2] = colapply_simple_triplet_matrix(
+  as.simple_triplet_matrix(dtm_train[ytrain==1, ]), var)
+summ[,3] = colapply_simple_triplet_matrix(
+  as.simple_triplet_matrix(dtm_train[ytrain==0, ]), mean)
+summ[,4] = colapply_simple_triplet_matrix(
+  as.simple_triplet_matrix(dtm_train[ytrain==0, ]), var)
+
+# Calculate total observations for positive review
+n1 = sum(ytrain); 
+n = length(ytrain)
+# Calculate total observations for negative review
+n0 = n - n1
+
+# T Statistics
+myp = (summ[,1] - summ[,3])/
+  sqrt(summ[,2]/n1 + summ[,4]/n0)
+
+words = colnames(dtm_train)
+
+# Order by T Statistics and select top 2500 words
+id = order(abs(myp), decreasing=TRUE)[1:2500]
+pos.list = words[id[myp[id]>0]]
+neg.list = words[id[myp[id]<0]]
+
+# Union the top negative and positive words
+pos_neg_list = union(pos.list, neg.list)
+
+# Show top 20 Positive words
+head(pos.list, 20)
+
+# Show top 20 Negative words
+head(neg.list, 20)
+```
+
+Now, we will select only the above computed top positive and negative words from the document term matrix and use it for fitting Logistic Regression using elasticnet regularization.
+
+```{r model, echo=TRUE,include=TRUE}
+set.seed(2042)
+
+dtm_train = dtm_train[, colnames(dtm_train) %in% pos_neg_list]
+
+tmpfit = glmnet(x = dtm_train, 
+                y = train$sentiment, 
+                alpha = 0.7,
+                family='binomial',
+                parallel = TRUE)
+```
+
+The glmnet output `tmpfit` contains 100 sets of estimated beta values corresponding to 100 different lambda values. Output of "tmpfit$df" denotes the number of non-zero beta values(i.e. df) for each of the 100 estimates.
+
+We picked three dfs among those which are equivalent to vocabsize (2000, 3000), (1000,2000) and (<= 1000), and store the corresponding words in "myvocab".
+
+Column selection happened to be a random process in order to produce vocabsize of ngrams for this exercise. For instance, we generated vocabsize of 741, 1757 and 2361 ngrams using non-zero beta values resided in 35th, 57th and 85th column.
+
+```{r vocab, echo=TRUE,include=TRUE}
+# Select the 35th column and select only those coefficients != 0
+myvocab_1000 = colnames(dtm_train)[which(tmpfit$beta[, 35] != 0)]
+length(myvocab_1000)
+
+# Select the 57th column and select only those coefficients != 0
+myvocab_1000_2000 = colnames(dtm_train)[which(tmpfit$beta[, 57] != 0)]
+length(myvocab_1000_2000)
+
+# Select the 85th column and select only those coefficients != 0
+myvocab_2000_3000 = colnames(dtm_train)[which(tmpfit$beta[, 85] != 0)]
+length(myvocab_2000_3000)
+
+# We found that with 741 vocab length, we could achive AUC > 0.96
+write.table(data.frame(vocab=myvocab_1000), file = "myvocab.txt", 
+            row.names = FALSE, sep='\t', col.names = FALSE)
+
+# Write 3 different sets of vocabulary which can meet the benchmark
+
+write.table(data.frame(vocab=myvocab_1000), file = "myvocab_1000.txt", 
+            row.names = FALSE, sep='\t', col.names = FALSE)
+
+write.table(data.frame(vocab=myvocab_1000_2000), file = "myvocab_1000_2000.txt", 
+            row.names = FALSE, sep='\t', col.names = FALSE)
+
+write.table(data.frame(vocab=myvocab_2000_3000), file = "myvocab_2000_3000.txt", 
+            row.names = FALSE, sep='\t', col.names = FALSE)
+```
+
+## Conclusion
+
+Logistic linear regression with ridge regularization worked extremely well when the minimum lambda value was used as a tuning parameter and we achieved an AUC greater than 0.96 using less than 1000 words in the vocabulary using the cv.glmnet function for prediction.
+
+## Acknowledgement
+
+We found Piazza posts "What we have tried" from Professor Feng Liang very helpful. Code snippets were used from the Piazza Post shared by Professor Feng Liang. 
